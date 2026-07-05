@@ -1,4 +1,4 @@
-const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
+const BOOKING_WEBHOOK_BASE_URL = "https://n8nnoob.dpdns.org/webhook";
 
 (() => {
   const endpoints = {
@@ -6,19 +6,15 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     booking: `${BOOKING_WEBHOOK_BASE_URL}/book-appointment`
   };
 
-  const serviceOptions = [
-    "Administrative Support",
-    "Data Entry",
-    "Email Management",
-    "Calendar Management",
-    "Recruitment Support",
-    "Document Management",
-    "Other"
-  ];
+  const BOOKING_STEP_COUNT = 4;
+  const AVAILABILITY_DAYS_TO_CHECK = 7;
+  const AVAILABILITY_CHECK_CONCURRENCY = 4;
+  const AVAILABILITY_RETRY_COUNT = 2;
 
   const state = {
     step: 0,
     availability: null,
+    availableSlots: [],
     isChecking: false,
     isSubmitting: false,
     data: {
@@ -45,10 +41,10 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     progress: "[data-booking-progress]",
     next: "[data-booking-next]",
     back: "[data-booking-back]",
-    check: "[data-booking-check]",
     confirm: "[data-booking-confirm]",
     closeSuccess: "[data-booking-success-close]",
     status: "[data-booking-status]",
+    slots: "[data-booking-slots]",
     summary: "[data-booking-summary]",
     error: "[data-booking-error]"
   };
@@ -66,8 +62,16 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
   };
 
   const getField = (key) => document.getElementById(fields[key]);
-  const getServices = () => Array.from(document.querySelectorAll("input[name='bookingServices']:checked")).map((input) => input.value);
   const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  const todayAsDateInput = (offsetDays = 0) => {
+    const date = new Date();
+    date.setDate(date.getDate() + offsetDays);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  };
 
   const normalizeAvailability = (value) => {
     if (typeof value === "string") return value.toLowerCase();
@@ -75,16 +79,68 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     return String(value.status || value.availability || value.available || "").toLowerCase();
   };
 
+  const getDurationMinutes = () => Number(String(state.data.duration || "").match(/\d+/)?.[0] || 30);
+
+  const formatDateLabel = (dateValue) => {
+    const [year, month, day] = dateValue.split("-").map(Number);
+    const date = new Date(year, month - 1, day);
+    return new Intl.DateTimeFormat("en-US", {
+      weekday: "short",
+      month: "short",
+      day: "numeric"
+    }).format(date);
+  };
+
+  const formatSlotLabel = (time) => {
+    const [hour, minute] = time.split(":").map(Number);
+    const date = new Date();
+    date.setHours(hour, minute, 0, 0);
+    return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(date);
+  };
+
+  const generateCandidateDates = () => {
+    return Array.from({ length: AVAILABILITY_DAYS_TO_CHECK }, (_, index) => todayAsDateInput(index));
+  };
+
+  const generateCandidateTimes = () => {
+    const durationMinutes = getDurationMinutes();
+    const startHour = 9;
+    const endHour = 17;
+    const stepMinutes = 60;
+    const slots = [];
+
+    for (let totalMinutes = startHour * 60; totalMinutes + durationMinutes <= endHour * 60; totalMinutes += stepMinutes) {
+      const hour = Math.floor(totalMinutes / 60);
+      const minute = totalMinutes % 60;
+      slots.push(`${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`);
+    }
+
+    return slots;
+  };
+
+  const runWithConcurrency = async (items, limit, task) => {
+    const results = [];
+    let nextIndex = 0;
+
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await task(items[currentIndex]);
+      }
+    });
+
+    await Promise.all(workers);
+    return results;
+  };
+
+  const wait = (milliseconds) => new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+
   const createModal = () => {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Manila";
     state.data.timezone = timezone;
-
-    const serviceMarkup = serviceOptions.map((service) => `
-      <label class="booking-option">
-        <input type="checkbox" name="bookingServices" value="${service}">
-        <span>${service}</span>
-      </label>
-    `).join("");
 
     const modalMarkup = `
       <div class="booking-overlay" id="bookingOverlay" aria-hidden="true">
@@ -101,7 +157,7 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
           </header>
 
           <div class="booking-progress" aria-label="Booking progress">
-            ${Array.from({ length: 6 }, (_, index) => `<span data-booking-progress="${index}"></span>`).join("")}
+            ${Array.from({ length: BOOKING_STEP_COUNT }, (_, index) => `<span data-booking-progress="${index}"></span>`).join("")}
           </div>
 
           <div class="booking-body">
@@ -133,13 +189,6 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
               </div>
 
               <div class="booking-step" data-booking-step="1">
-                <h3>Service Needed</h3>
-                <p class="booking-group-label">Choose all that apply.</p>
-                <div class="booking-options" data-field="services">${serviceMarkup}</div>
-                <span class="booking-error-text" data-services-error aria-live="polite"></span>
-              </div>
-
-              <div class="booking-step" data-booking-step="2">
                 <h3>Project Details</h3>
                 <div class="booking-field full" data-field="description">
                   <label for="bookingDescription">How can I help? *</label>
@@ -148,19 +197,9 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
                 </div>
               </div>
 
-              <div class="booking-step" data-booking-step="3">
-                <h3>Meeting</h3>
-                <div class="booking-grid">
-                  <div class="booking-field" data-field="date">
-                    <label for="bookingDate">Preferred Date *</label>
-                    <input id="bookingDate" name="date" type="date" required>
-                    <span class="booking-error-text" aria-live="polite"></span>
-                  </div>
-                  <div class="booking-field" data-field="time">
-                    <label for="bookingTime">Preferred Time *</label>
-                    <input id="bookingTime" name="time" type="time" required>
-                    <span class="booking-error-text" aria-live="polite"></span>
-                  </div>
+              <div class="booking-step" data-booking-step="2">
+                <h3>Available Consultation Times</h3>
+                <div class="booking-grid booking-meeting-options">
                   <div class="booking-field" data-field="timezone">
                     <label for="bookingTimezone">Timezone *</label>
                     <input id="bookingTimezone" name="timezone" type="text" value="${timezone}" required>
@@ -176,21 +215,17 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
                     <span class="booking-error-text" aria-live="polite"></span>
                   </div>
                 </div>
-              </div>
-
-              <div class="booking-step" data-booking-step="4">
-                <h3>Availability</h3>
+                <input id="bookingDate" name="date" type="hidden">
+                <input id="bookingTime" name="time" type="hidden">
                 <div class="booking-availability">
                   <div class="booking-status-card" data-booking-status>
-                    Select your preferred meeting details, then check if the slot is available.
+                    Available dates will load automatically.
                   </div>
-                  <button class="booking-btn secondary" type="button" data-booking-check>
-                    Check Availability
-                  </button>
+                  <div class="booking-slot-grid" data-booking-slots aria-live="polite"></div>
                 </div>
               </div>
 
-              <div class="booking-step" data-booking-step="5">
+              <div class="booking-step" data-booking-step="3">
                 <h3>Confirmation</h3>
                 <div class="booking-summary" data-booking-summary></div>
                 <div class="booking-error-card booking-hidden" data-booking-error>
@@ -198,12 +233,12 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
                 </div>
               </div>
 
-              <div class="booking-step" data-booking-step="6">
+              <div class="booking-step" data-booking-step="4">
                 <div class="booking-success">
                   <div class="booking-success-icon">✓</div>
                   <h3>Thank you!</h3>
                   <p>Your consultation request has been received.</p>
-                  <p>You'll receive a confirmation email shortly.</p>
+                  <p>You'll receive a confirmation email once the request is approved.</p>
                 </div>
               </div>
             </form>
@@ -232,7 +267,7 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
       const field = getField(key);
       if (field) state.data[key] = field.value.trim();
     });
-    state.data.services = getServices();
+    state.data.services = [];
   };
 
   const setError = (fieldKey, message = "") => {
@@ -245,8 +280,6 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
 
   const clearErrors = () => {
     Object.keys(fields).forEach((key) => setError(key));
-    const serviceError = document.querySelector("[data-services-error]");
-    if (serviceError) serviceError.textContent = "";
   };
 
   const validateStep = () => {
@@ -265,24 +298,20 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
       }
     }
 
-    if (state.step === 1 && state.data.services.length === 0) {
-      const serviceError = document.querySelector("[data-services-error]");
-      if (serviceError) serviceError.textContent = "Please select at least one service.";
-      isValid = false;
-    }
-
-    if (state.step === 2 && !state.data.description) {
+    if (state.step === 1 && !state.data.description) {
       setError("description", "Project details are required.");
       isValid = false;
     }
 
-    if (state.step === 3 || state.step === 4) {
-      ["date", "time", "timezone", "duration"].forEach((key) => {
+    if (state.step === 2) {
+      ["timezone", "duration"].forEach((key) => {
         if (!state.data[key]) {
           setError(key, "This field is required.");
           isValid = false;
         }
       });
+
+      if (!state.data.date || !state.data.time) isValid = false;
     }
 
     return isValid;
@@ -300,8 +329,7 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     summary.innerHTML = `
       <div class="booking-summary-row"><strong>Name</strong><span>${state.data.name}</span></div>
       <div class="booking-summary-row"><strong>Email</strong><span>${state.data.email}</span></div>
-      <div class="booking-summary-row"><strong>Selected Service</strong><span>${state.data.services.join(", ")}</span></div>
-      <div class="booking-summary-row"><strong>Meeting Time</strong><span>${state.data.date} at ${state.data.time} (${state.data.duration})</span></div>
+      <div class="booking-summary-row"><strong>Meeting Time</strong><span>${formatDateLabel(state.data.date)} at ${formatSlotLabel(state.data.time)} (${state.data.duration})</span></div>
       <div class="booking-summary-row"><strong>Timezone</strong><span>${state.data.timezone}</span></div>
     `;
   };
@@ -310,7 +338,50 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     const status = modal.querySelector(selectors.status);
     if (!status) return;
     status.className = `booking-status-card ${statusClass}`.trim();
-    status.textContent = message;
+    status.innerHTML = message;
+  };
+
+  const groupSlotsByDate = () => {
+    return state.availableSlots.reduce((groups, slot) => {
+      if (!groups[slot.date]) groups[slot.date] = [];
+      groups[slot.date].push(slot);
+      return groups;
+    }, {});
+  };
+
+  const renderSlots = () => {
+    const slots = modal.querySelector(selectors.slots);
+    if (!slots) return;
+
+    if (!state.availableSlots.length) {
+      slots.innerHTML = "";
+      return;
+    }
+
+    const groupedSlots = groupSlotsByDate();
+    const dateButtons = Object.entries(groupedSlots).map(([date, dateSlots]) => `
+      <button class="booking-date-button${state.data.date === date ? " is-selected" : ""}" type="button" data-available-date="${date}">
+        <strong>${formatDateLabel(date)}</strong>
+        <span>${dateSlots.length} times</span>
+      </button>
+    `).join("");
+    const selectedSlots = state.data.date ? groupedSlots[state.data.date] || [] : [];
+
+    slots.innerHTML = `
+      <div class="booking-date-selector">${dateButtons}</div>
+      ${state.data.date ? `
+        <div class="booking-date-group">
+          <p class="booking-date-label">${formatDateLabel(state.data.date)}</p>
+          <div class="booking-date-slots">
+            ${selectedSlots.map((slot) => `
+              <button class="booking-slot${state.data.time === slot.time ? " is-selected" : ""}" type="button" data-slot-date="${slot.date}" data-slot-time="${slot.time}">
+                ${formatSlotLabel(slot.time)}
+              </button>
+            `).join("")}
+          </div>
+        </div>
+      ` : ""}
+    `;
   };
 
   const renderStep = () => {
@@ -321,7 +392,7 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     modal.querySelectorAll(selectors.progress).forEach((progress) => {
       const index = Number(progress.dataset.bookingProgress);
       progress.classList.toggle("is-active", index === state.step);
-      progress.classList.toggle("is-complete", index < state.step || state.step === 6);
+      progress.classList.toggle("is-complete", index < state.step || state.step === BOOKING_STEP_COUNT);
     });
 
     const backButton = modal.querySelector(selectors.back);
@@ -329,56 +400,143 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     const confirmButton = modal.querySelector(selectors.confirm);
     const successCloseButton = modal.querySelector(selectors.closeSuccess);
 
-    backButton.classList.toggle("booking-hidden", state.step === 0 || state.step === 6);
-    nextButton.classList.toggle("booking-hidden", state.step >= 5);
-    confirmButton.classList.toggle("booking-hidden", state.step !== 5);
-    successCloseButton.classList.toggle("booking-hidden", state.step !== 6);
+    backButton.classList.toggle("booking-hidden", state.step === 0 || state.step === BOOKING_STEP_COUNT);
+    nextButton.classList.toggle("booking-hidden", state.step >= 3);
+    confirmButton.classList.toggle("booking-hidden", state.step !== 3);
+    successCloseButton.classList.toggle("booking-hidden", state.step !== BOOKING_STEP_COUNT);
 
-    nextButton.disabled = state.step === 4 && state.availability !== "available";
-    if (state.step === 5) renderSummary();
+    nextButton.disabled = state.step === 2 && (state.availability !== "available" || state.isChecking || !state.data.date || !state.data.time);
+    if (state.step === 3) renderSummary();
+    renderSlots();
   };
 
   const resetAvailability = () => {
     state.availability = null;
-    renderAvailability("Select your preferred meeting details, then check if the slot is available.");
+    state.availableSlots = [];
+    state.data.date = "";
+    state.data.time = "";
+    const date = getField("date");
+    const time = getField("time");
+    if (date) date.value = "";
+    if (time) time.value = "";
+    renderAvailability("Available dates will load automatically.");
+    renderSlots();
   };
 
-  const checkAvailability = async () => {
-    if (!validateStep()) return;
-    const button = modal.querySelector(selectors.check);
-    setLoading(button, true, "Checking");
-    state.isChecking = true;
+  const checkSlot = async (date, time) => {
+    for (let attempt = 0; attempt <= AVAILABILITY_RETRY_COUNT; attempt += 1) {
+      try {
+        const response = await fetch(endpoints.availability, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/plain"
+          },
+          body: JSON.stringify({
+            name: state.data.name,
+            email: state.data.email,
+            date,
+            time,
+            timezone: state.data.timezone,
+            duration: state.data.duration
+          })
+        });
+        const contentType = response.headers.get("content-type") || "";
+        const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+        const result = normalizeAvailability(payload);
 
-    try {
-      const query = new URLSearchParams({
-        date: state.data.date,
-        time: state.data.time,
+        if (response.ok && (result === "available" || result === "true")) return { date, time };
+        if (response.ok) return null;
+      } catch (error) {
+        if (attempt === AVAILABILITY_RETRY_COUNT) return null;
+      }
+
+      await wait(350 * (attempt + 1));
+    }
+
+    return null;
+  };
+
+  const checkAvailabilityRange = async (dates) => {
+    const response = await fetch(endpoints.availability, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/plain"
+      },
+      body: JSON.stringify({
+        name: state.data.name,
+        email: state.data.email,
+        dateRangeStart: dates[0],
+        dateRangeEnd: dates[dates.length - 1],
         timezone: state.data.timezone,
         duration: state.data.duration
-      });
-      const response = await fetch(`${endpoints.availability}?${query.toString()}`, {
-        method: "GET",
-        headers: { Accept: "application/json, text/plain" }
-      });
-      const contentType = response.headers.get("content-type") || "";
-      const payload = contentType.includes("application/json") ? await response.json() : await response.text();
-      const result = normalizeAvailability(payload);
+      })
+    });
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json") ? await response.json() : await response.text();
 
-      if (!response.ok) throw new Error("Availability check failed.");
+    if (!response.ok || !payload || !Array.isArray(payload.slots)) {
+      throw new Error("Range availability failed.");
+    }
 
-      if (result === "available" || result === "true") {
+    return payload.slots.filter((slot) => slot.date && slot.time);
+  };
+
+  const checkAvailabilityFallback = async (dates) => {
+    const times = generateCandidateTimes();
+    const checks = dates.flatMap((dateValue) => times.map((timeValue) => ({ date: dateValue, time: timeValue })));
+    return (await runWithConcurrency(
+      checks,
+      AVAILABILITY_CHECK_CONCURRENCY,
+      ({ date: dateValue, time: timeValue }) => checkSlot(dateValue, timeValue)
+    )).filter(Boolean);
+  };
+
+  const loadAvailability = async () => {
+    collectData();
+    clearErrors();
+
+    if (!state.data.timezone || !state.data.duration) {
+      ["timezone", "duration"].forEach((key) => {
+        if (!state.data[key]) setError(key, "This field is required.");
+      });
+      return;
+    }
+
+    state.isChecking = true;
+    state.availability = null;
+    state.availableSlots = [];
+    state.data.date = "";
+    state.data.time = "";
+    const date = getField("date");
+    const time = getField("time");
+    if (date) date.value = "";
+    if (time) time.value = "";
+    renderSlots();
+    renderAvailability(`<span class="booking-spinner" aria-hidden="true"></span>Loading available dates...`);
+    renderStep();
+
+    try {
+      const dates = generateCandidateDates();
+      try {
+        state.availableSlots = await checkAvailabilityRange(dates);
+      } catch (error) {
+        state.availableSlots = await checkAvailabilityFallback(dates);
+      }
+
+      if (state.availableSlots.length) {
         state.availability = "available";
-        renderAvailability("✓ Available", "available");
+        renderAvailability("Choose an available date below.", "available");
       } else {
         state.availability = "unavailable";
-        renderAvailability("This time isn't available. Please choose another slot.", "unavailable");
+        renderAvailability("No available consultation times were found in the next 7 days.", "unavailable");
       }
     } catch (error) {
       state.availability = "unavailable";
-      renderAvailability("Unable to check availability. Please try again.", "unavailable");
+      renderAvailability("Unable to load available dates. Please try again.", "unavailable");
     } finally {
       state.isChecking = false;
-      setLoading(button, false, "Check Availability");
       renderStep();
     }
   };
@@ -401,9 +559,12 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
         body: JSON.stringify(state.data)
       });
 
-      if (!response.ok) throw new Error("Booking submission failed.");
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json") ? await response.json() : {};
 
-      state.step = 6;
+      if (!response.ok || payload.success === false) throw new Error(payload.message || "Booking submission failed.");
+
+      state.step = BOOKING_STEP_COUNT;
       renderStep();
     } catch (error) {
       errorCard.classList.remove("booking-hidden");
@@ -416,6 +577,7 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
   const resetForm = () => {
     state.step = 0;
     state.availability = null;
+    state.availableSlots = [];
     state.isChecking = false;
     state.isSubmitting = false;
     state.data = {
@@ -434,8 +596,12 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     if (form) form.reset();
     const timezone = getField("timezone");
     const duration = getField("duration");
+    const date = getField("date");
+    const time = getField("time");
     if (timezone) timezone.value = state.data.timezone;
     if (duration) duration.value = state.data.duration;
+    if (date) date.value = "";
+    if (time) time.value = "";
     clearErrors();
     resetAvailability();
     const errorCard = modal.querySelector(selectors.error);
@@ -477,6 +643,21 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
     if (event.key === "Escape") closeModal();
   };
 
+  const handleNext = async () => {
+    if (!validateStep()) return;
+
+    if (state.step === 1) {
+      state.step = 2;
+      renderStep();
+      loadAvailability();
+      return;
+    }
+
+    if (state.step === 2 && state.availability !== "available") return;
+    state.step = Math.min(state.step + 1, 3);
+    renderStep();
+  };
+
   const bindEvents = () => {
     document.addEventListener("click", (event) => {
       const opener = event.target.closest(selectors.openButton);
@@ -490,25 +671,54 @@ const BOOKING_WEBHOOK_BASE_URL = "https://your-n8n-domain.com/webhook";
       if (event.target === modal || event.target.closest(selectors.closeButton)) closeModal();
     });
 
-    modal.querySelector(selectors.next).addEventListener("click", () => {
-      if (!validateStep()) return;
-      if (state.step === 4 && state.availability !== "available") return;
-      state.step = Math.min(state.step + 1, 5);
-      renderStep();
-    });
+    modal.querySelector(selectors.next).addEventListener("click", handleNext);
 
     modal.querySelector(selectors.back).addEventListener("click", () => {
       state.step = Math.max(state.step - 1, 0);
       renderStep();
     });
 
-    modal.querySelector(selectors.check).addEventListener("click", checkAvailability);
+    modal.querySelector(selectors.slots).addEventListener("click", (event) => {
+      const dateButton = event.target.closest("[data-available-date]");
+      if (dateButton) {
+        state.data.date = dateButton.dataset.availableDate;
+        state.data.time = "";
+        const date = getField("date");
+        const time = getField("time");
+        if (date) date.value = state.data.date;
+        if (time) time.value = "";
+        renderAvailability(`Choose an available time for ${formatDateLabel(state.data.date)}.`, "available");
+        renderStep();
+        return;
+      }
+
+      const slot = event.target.closest("[data-slot-time]");
+      if (!slot) return;
+
+      state.data.date = slot.dataset.slotDate;
+      state.data.time = slot.dataset.slotTime;
+      const date = getField("date");
+      const time = getField("time");
+      if (date) date.value = state.data.date;
+      if (time) time.value = state.data.time;
+      state.availability = "available";
+      renderAvailability(`${formatDateLabel(state.data.date)} at ${formatSlotLabel(state.data.time)} is selected.`, "available");
+      renderStep();
+    });
+
     modal.querySelector(selectors.confirm).addEventListener("click", submitBooking);
     modal.querySelector(selectors.closeSuccess).addEventListener("click", closeModal);
 
-    ["date", "time", "timezone", "duration"].forEach((key) => {
-      getField(key).addEventListener("input", resetAvailability);
-      getField(key).addEventListener("change", resetAvailability);
+    ["timezone", "duration"].forEach((key) => {
+      const field = getField(key);
+      field.addEventListener("input", () => {
+        resetAvailability();
+        if (state.step === 2) loadAvailability();
+      });
+      field.addEventListener("change", () => {
+        resetAvailability();
+        if (state.step === 2) loadAvailability();
+      });
     });
 
     document.addEventListener("keydown", handleKeydown);
