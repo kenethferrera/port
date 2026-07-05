@@ -9,6 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="../css/booking.css">
   <style>
     
     @font-face {
@@ -771,7 +772,7 @@
     <div class="nav-bar">
       <a class="brand-name" href="#home">Vanessa Faner</a>
       <div class="nav-actions">
-        <a class="hire-btn" href="#contact">Hire Me</a>
+        <a class="hire-btn" href="#book-consultation" data-booking-open aria-haspopup="dialog">Book a Consultation</a>
         <button class="hamburger" id="hamburger" type="button" aria-label="Open navigation menu" aria-expanded="false">
           <i class="fa-solid fa-bars"></i>
         </button>
@@ -821,7 +822,7 @@
           <h1>Helping Businesses Stay Organized with Reliable Virtual Assistance</h1>
           <p>I help busy founders and teams stay on top of the details that keep a business running - from managing inboxes and calendars to coordinating recruitment and keeping documents organized and accurate. With a background in HR, administrative, and legal support, I bring precision, discretion, and dependability to every task I take on.</p>
           <div class="hero-buttons">
-            <a class="btn btn-primary" href="#contact">Hire Me</a>
+            <a class="btn btn-primary" href="#book-consultation" data-booking-open aria-haspopup="dialog">Book a Consultation</a>
             <a class="btn btn-secondary" href="../Faner,%20Vanessa%20Faye%20F.%20(1).pdf" download>Download Resume</a>
           </div>
         </div>
@@ -1073,6 +1074,7 @@
     </div>
   </footer>
 
+  <script src="../js/booking.js" defer></script>
   <script>
     const nav = document.querySelector("#siteNav");
     const hamburger = document.querySelector("#hamburger");
